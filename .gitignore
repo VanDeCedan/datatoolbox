@@ -1,0 +1,36 @@
+# Environments
+myenv/
+env/
+venv/
+#.env
+.venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VS Code / IDEs
+.vscode/
+.idea/
+*.bat
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Weights and data
+weights/
+*.pth
+*.pt
+*.onnx
+*.zip
+output/
+pdfs/
+batches/
+deskewed/

@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environment
+myenv
+.venv/
+venv/
+env/
+
+# YOLO training artifacts (not needed in Docker image)
+runs/
+*.yaml
+
+# Jupyter notebooks (not part of the app)
+*.ipynb
+.ipynb_checkpoints/
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE configs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Test data (user mounts volumes instead)
+data/
+input/
+output/
+
+# Logs
+*.log
+
+# Git
+.git/
+.gitignore
