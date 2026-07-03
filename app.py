@@ -766,7 +766,9 @@ def apply_camera_grain(pil_img: Image.Image) -> Image.Image:
     h, w, c = img_np.shape
     noise = np.random.normal(0, 8, (h, w, c))
     noisy_img = np.clip(img_np.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    return Image.fromarray(noisy_img)
+    out_img = Image.fromarray(noisy_img)
+    del img_np, noise, noisy_img
+    return out_img
 
 
 def apply_salt_pepper_noise(pil_img: Image.Image, amount: float = 0.01) -> Image.Image:
@@ -784,7 +786,9 @@ def apply_salt_pepper_noise(pil_img: Image.Image, amount: float = 0.01) -> Image
     pepper_x = np.random.randint(0, w, num_pixels)
     noisy_img[pepper_y, pepper_x] = 0
     
-    return Image.fromarray(noisy_img)
+    out_img = Image.fromarray(noisy_img)
+    del img_np, noisy_img, salt_y, salt_x, pepper_y, pepper_x
+    return out_img
 
 
 def apply_blur(pil_img: Image.Image, ksize: int = 5) -> Image.Image:
@@ -792,7 +796,9 @@ def apply_blur(pil_img: Image.Image, ksize: int = 5) -> Image.Image:
     import numpy as np
     img_np = np.array(pil_img)
     blurred = cv2.GaussianBlur(img_np, (ksize, ksize), 0)
-    return Image.fromarray(blurred)
+    out_img = Image.fromarray(blurred)
+    del img_np, blurred
+    return out_img
 
 
 def flip_labels_horizontal(coords: list[float]) -> list[float]:
@@ -1116,8 +1122,8 @@ def run_get_labels_images(
                     log(f"  ❌ Impossible de charger l'image {Path(img_path).name} : {e}")
                     continue
 
-                if processed_count % 100 == 0:
-                    gc.collect()
+                # Force garbage collection after every image to keep memory flat
+                gc.collect()
 
                 if processed_count % yield_interval == 0 or processed_count == total_pairs:
                     yield "\n".join(logs), None, None
@@ -1136,7 +1142,8 @@ def run_get_labels_images(
         log(f"✅ ZIP prêt — {zip_size / (1024 * 1024):.2f} MB")
         
         df = pd.DataFrame(all_records)
-        yield "\n".join(logs), str(zip_path), df
+        log(f"📊 {len(df)} lignes de résultats générées (affichage des 100 premières lignes dans le tableau).")
+        yield "\n".join(logs), str(zip_path), df.head(100)
 
     except Exception as exc:
         try:
