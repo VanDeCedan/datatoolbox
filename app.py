@@ -294,6 +294,214 @@ def run_classify_mode(
         return f"❌ Erreur inattendue : {exc}", None, None
 
 
+_om_classifier: Optional[object] = None
+
+def get_om_classifier_session():
+    global _om_classifier
+    if _om_classifier is None:
+        from huggingface_hub import hf_hub_download
+        import onnxruntime as ort
+        
+        # Download from Nicias/om_classifier
+        model_path = hf_hub_download(repo_id="Nicias/om_classifier", filename="best_model3.onnx")
+        _om_classifier = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    return _om_classifier
+
+
+def predict_card_type_onnx_internal(img_path, session, image_size=None) -> tuple[str, float]:
+    import numpy as np
+    from PIL import Image
+    import os
+    
+    # 0: 'NON_SEMO', 1: 'SEMO'
+    class_labels = ['NON_SEMO', 'SEMO']
+
+    if image_size is None:
+        try:
+            model_shape = session.get_inputs()[0].shape
+            expected_h = model_shape[2]
+            expected_w = model_shape[3]
+            h = expected_h if isinstance(expected_h, int) else 512
+            w = expected_w if isinstance(expected_w, int) else 512
+            image_size = (w, h)
+        except Exception:
+            image_size = (512, 512)
+
+    try:
+        pil_img = Image.open(img_path).convert('RGB')
+        pil_img = pil_img.resize(image_size, Image.BILINEAR)
+        img_np = np.array(pil_img).astype(np.float32) / 255.0
+        img_tensor = img_np.transpose(2, 0, 1)
+        
+        # ImageNet normalization matching transforms.Normalize
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+        img_tensor = (img_tensor - mean) / std
+        
+        img_input = np.expand_dims(img_tensor, axis=0)
+    except Exception as e:
+        print(f'Error loading/preprocessing image: {e}')
+        raise e
+
+    try:
+        input_name = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
+        logits = session.run([output_name], {input_name: img_input})[0]
+    except Exception as e:
+        print(f'Error running inference: {e}')
+        raise e
+
+    logits = np.asarray(logits, dtype=np.float32)
+    logits = logits.reshape(-1, len(class_labels))
+    exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+    probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+    probs = probs[0]
+    predicted_class = int(np.argmax(probs))
+    confidence = float(probs[predicted_class])
+
+    return class_labels[predicted_class], confidence
+
+
+def run_om_classifier(
+    uploaded_files,
+    conf_threshold_pct: int,
+) -> tuple[str, str | None, pd.DataFrame | None]:
+    if not uploaded_files:
+        return "⚠️ Aucun fichier uploadé.", None, None
+
+    conf_threshold = conf_threshold_pct / 100.0
+    logs = []
+
+    def log(msg: str):
+        logs.append(msg)
+
+    log("🔮 Téléchargement / Chargement du modèle OM Classifier (best_model3.onnx)…")
+    try:
+        session = get_om_classifier_session()
+    except Exception as exc:
+        log(f"❌ Erreur lors du chargement du modèle : {exc}")
+        return "\n".join(logs), None, None
+
+    tmp_root = tempfile.mkdtemp()
+    all_records = []
+    all_skipped = []
+
+    try:
+        tmp_path = Path(tmp_root)
+        out_dir = tmp_path / "output"
+        pdf_dir = tmp_path / "pdfs"
+        out_dir.mkdir()
+        pdf_dir.mkdir()
+
+        for uf in uploaded_files:
+            fpath = _get_path(uf)
+            fname = Path(fpath).name
+            is_pdf = fname.lower().endswith(".pdf")
+            stem = Path(fname).stem
+
+            if is_pdf:
+                log(f"📄 Traitement PDF : {fname}")
+                pdf_tmp = pdf_dir / fname
+                shutil.copy(fpath, pdf_tmp)
+                try:
+                    n_pages = count_pdf_pages(pdf_tmp)
+                    for page_num, pil_img in pdf_to_images(pdf_tmp):
+                        log(f"  📃 Page {page_num}/{n_pages}…")
+                        
+                        # Save page PIL image as PNG temporarily to match matplotlib loading
+                        temp_page_path = Path(tempfile.gettempdir()) / f"temp_page_{os.getpid()}_{page_num}.png"
+                        pil_img.save(str(temp_page_path), "PNG")
+                        try:
+                            pred_class, conf = predict_card_type_onnx_internal(str(temp_page_path), session)
+                        finally:
+                            if temp_page_path.exists():
+                                try:
+                                    temp_page_path.unlink()
+                                except Exception:
+                                    pass
+                        
+                        is_semo = (pred_class == "SEMO") and (conf >= conf_threshold)
+                        
+                        if is_semo:
+                            page_part = f"_p{page_num:03d}"
+                            out_path = out_dir / f"{stem}{page_part}.jpg"
+                            pil_resized = pil_img.resize((624, 624), Image.Resampling.LANCZOS)
+                            pil_resized.save(str(out_path), "JPEG", quality=95)
+                            status = "Inclus (SEMO)"
+                            log(f"    ✅ {pred_class} ({conf:.1%}) -> Conservé (Resized 624x624)")
+                            all_records.append({
+                                "Fichier": fname, "Page": page_num,
+                                "Classe": pred_class, "Conf.": f"{conf:.2%}",
+                                "Statut": status
+                            })
+                        else:
+                            status = f"Ignoré ({pred_class})"
+                            log(f"    ❌ {pred_class} ({conf:.1%}) -> Ignoré")
+                            all_skipped.append({
+                                "Fichier": fname, "Page": page_num,
+                                "Classe": pred_class, "Conf.": f"{conf:.2%}",
+                                "Statut": status
+                            })
+                        pil_img = None
+                except Exception as exc:
+                    log(f"  ❌ Erreur PDF : {exc}")
+                    all_skipped.append({"Fichier": fname, "Page": "—", "Classe": "—", "Conf.": "—", "Statut": f"Erreur: {exc}"})
+            else:
+                log(f"🖼️ Traitement image : {fname}")
+                try:
+                    pred_class, conf = predict_card_type_onnx_internal(fpath, session)
+                    
+                    is_semo = (pred_class == "SEMO") and (conf >= conf_threshold)
+                    
+                    if is_semo:
+                        out_path = out_dir / f"{stem}.jpg"
+                        pil_img = Image.open(fpath).convert("RGB")
+                        pil_resized = pil_img.resize((624, 624), Image.Resampling.LANCZOS)
+                        pil_resized.save(str(out_path), "JPEG", quality=95)
+                        status = "Inclus (SEMO)"
+                        log(f"  ✅ {pred_class} ({conf:.1%}) -> Conservé (Resized 624x624)")
+                        all_records.append({
+                            "Fichier": fname, "Page": "—",
+                            "Classe": pred_class, "Conf.": f"{conf:.2%}",
+                            "Statut": status
+                        })
+                    else:
+                        status = f"Ignoré ({pred_class})"
+                        log(f"  ❌ {pred_class} ({conf:.1%}) -> Ignoré")
+                        all_skipped.append({
+                            "Fichier": fname, "Page": "—",
+                            "Classe": pred_class, "Conf.": f"{conf:.2%}",
+                            "Statut": status
+                        })
+                except Exception as exc:
+                    log(f"  ❌ Erreur : {exc}")
+                    all_skipped.append({"Fichier": fname, "Page": "—", "Classe": "—", "Conf.": "—", "Statut": f"Erreur: {exc}"})
+
+        df_list = all_records + all_skipped
+        df = pd.DataFrame(df_list) if df_list else None
+
+        if not all_records:
+            log("⚠️ Aucun résultat classé comme SEMO à inclure.")
+            return "\n".join(logs), None, df
+
+        log("📦 Génération du ZIP…")
+        zip_path = tmp_path / "results_om_classify.zip"
+        build_zip_to_file(out_dir, zip_path)
+        zip_size = zip_path.stat().st_size
+        log(f"✅ ZIP prêt — {zip_size / 1024:.0f} KB")
+        log(f"🎉 Terminé ! {len(all_records)} image(s) SEMO conservée(s) sur {len(df_list)} fichier(s)/page(s).")
+
+        return "\n".join(logs), str(zip_path), df
+
+    except Exception as exc:
+        try:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        except Exception:
+            pass
+        return f"❌ Erreur inattendue : {exc}", None, None
+
+
+
 # ---------------------------------------------------------------------------
 # Tab 2 — Only Deskew
 # ---------------------------------------------------------------------------
@@ -1397,6 +1605,93 @@ with gr.Blocks(css=CUSTOM_CSS, title="Data Toolbox — Momo AI") as demo:
                         logs, zip_p, df = run_classify_mode(files, conf, "yolo_annotation")
                         return logs, gr.update(value=zip_p, visible=zip_p is not None), df_update_with_count(df)
                     c3_btn.click(fn_c3, inputs=[c3_files, c3_conf], outputs=[c3_log, c3_dl, c3_df])
+
+                with gr.Tab("OM Classifier"):
+                    gr.Markdown("### Classification avec modèle ONNX dédié (SEMO vs NON_SEMO)")
+                    
+                    om_files_state = gr.State([])
+
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            om_files = gr.File(label="Upload Images ou PDFs (cumulatif)", file_count="multiple", file_types=["image", ".pdf"], elem_classes=["horizontal-files"])
+                            with gr.Row():
+                                om_dir = gr.Textbox(label="Ou dossier local d'images/PDFs", placeholder="Ex: C:\\images")
+                                om_scan_btn = gr.Button("🔍 Scanner dossier", variant="secondary")
+                            with gr.Row():
+                                om_files_status = gr.Markdown("**Fichiers accumulés :** 0")
+                                om_clear_btn = gr.Button("🗑️ Vider les fichiers", variant="secondary")
+                        with gr.Column(scale=1):
+                            om_conf = gr.Slider(minimum=0, maximum=100, value=50, step=5, label="Seuil de confiance SEMO (%)")
+                    
+                    om_btn = gr.Button("🚀 Lancer OM Classification", variant="primary")
+                    with gr.Row():
+                        om_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
+                    with gr.Row():
+                        om_dl = gr.File(label="⬇️ Télécharger ZIP (Images SEMO uniquement)", visible=False)
+                        om_df = gr.Dataframe(label="📊 Résultats", visible=False)
+
+                    def add_om_files(new_files, current_state):
+                        if not new_files:
+                            yield current_state, f"**Fichiers accumulés :** {len(current_state)}"
+                            return
+                        import gc
+                        existing_names = {Path(p).name for p in current_state}
+                        batch_size = 50
+                        total_new = len(new_files)
+                        for i in range(0, total_new, batch_size):
+                            batch = new_files[i:i+batch_size]
+                            for f in batch:
+                                path_str = _get_path(f)
+                                name = Path(path_str).name
+                                if name not in existing_names:
+                                    current_state.append(path_str)
+                                    existing_names.add(name)
+                            gc.collect()
+                            yield current_state, f"**Fichiers accumulés :** {len(current_state)} (Chargement : {min(i+batch_size, total_new)}/{total_new})"
+                        yield current_state, f"**Fichiers accumulés :** {len(current_state)}"
+
+                    def scan_om_dir(dir_path, current_state):
+                        if not dir_path or not os.path.exists(dir_path):
+                            yield current_state, f"⚠️ Le dossier '{dir_path}' n'existe pas."
+                            return
+                        valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.pdf'}
+                        found_files = []
+                        try:
+                            with os.scandir(dir_path) as it:
+                                for entry in it:
+                                    if entry.is_file():
+                                        ext = Path(entry.name).suffix.lower()
+                                        if ext in valid_exts:
+                                            found_files.append(entry.path)
+                        except Exception as e:
+                            yield current_state, f"❌ Erreur lors du scan : {e}"
+                            return
+                        if not found_files:
+                            yield current_state, f"⚠️ Aucun fichier image ou PDF trouvé dans '{dir_path}'."
+                            return
+                        
+                        yield from add_om_files(found_files, current_state)
+
+                    om_files.change(
+                        fn=add_om_files,
+                        inputs=[om_files, om_files_state],
+                        outputs=[om_files_state, om_files_status]
+                    )
+                    om_scan_btn.click(
+                        fn=scan_om_dir,
+                        inputs=[om_dir, om_files_state],
+                        outputs=[om_files_state, om_files_status]
+                    )
+                    om_clear_btn.click(
+                        fn=lambda: ([], "**Fichiers accumulés :** 0"),
+                        inputs=[],
+                        outputs=[om_files_state, om_files_status]
+                    )
+
+                    def fn_om(files_state, conf):
+                        logs, zip_p, df = run_om_classifier(files_state, conf)
+                        return logs, gr.update(value=zip_p, visible=zip_p is not None), df_update_with_count(df)
+                    om_btn.click(fn_om, inputs=[om_files_state, om_conf], outputs=[om_log, om_dl, om_df])
 
         # ── Tab 2 : Only Deskew ─────────────────────────────────────────────
         with gr.Tab("Redresser"):
