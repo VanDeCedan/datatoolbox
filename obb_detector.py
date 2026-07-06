@@ -57,7 +57,7 @@ def letterbox_image_cv(img: np.ndarray, new_shape=(640, 640), color=(114, 114, 1
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return img, r, (dw, dh)
+    return img, r, (left, top)
 
 def enhance_image(img_bgr: np.ndarray) -> np.ndarray:
     """Apply CLAHE and Sharpening to improve text readability for annotation."""
@@ -95,13 +95,13 @@ def xywhr2xyxyxyxy(rboxes):
     return np.stack([pt1, pt2, pt3, pt4], axis=1)
 
 class ObbDetector:
-    def __init__(self, conf_threshold: float = CONFIDENCE_THRESHOLD):
+    def __init__(self, conf_threshold: float = CONFIDENCE_THRESHOLD, repo_id: str = HF_REPO_ID, filename: str = HF_FILENAME, names: dict = None):
         from huggingface_hub import hf_hub_download
         import onnxruntime as ort
         
         self.conf_threshold = conf_threshold
         try:
-            weights = Path(hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILENAME))
+            weights = Path(hf_hub_download(repo_id=repo_id, filename=filename))
         except Exception as e:
             print(f"Warning: Failed to download model from Hugging Face: {e}")
             raise e
@@ -110,7 +110,10 @@ class ObbDetector:
         self.input_name = self.session.get_inputs()[0].name
         
         # Hardcoding standard names for now, or parsing from ONNX if possible
-        self.names = {0: "ZONE1", 1: "ZONE2", 2: "ZONE3", 3: "ZONE4"}
+        if names is not None:
+            self.names = names
+        else:
+            self.names = {0: "ZONE1", 1: "ZONE2", 2: "ZONE3", 3: "ZONE4"}
 
     def _deskew_crop(self, img: np.ndarray, pts: np.ndarray) -> np.ndarray:
         rect = order_points(pts)
@@ -139,7 +142,8 @@ class ObbDetector:
         return warped
 
     def _run_inference(self, img_bgr: np.ndarray, pred_size=(640, 640)):
-        padded_img, scale, (pad_w, pad_h) = letterbox_image_cv(img_bgr, new_shape=pred_size)
+        orig_h, orig_w = img_bgr.shape[:2]
+        padded_img, scale, (pad_left, pad_top) = letterbox_image_cv(img_bgr, new_shape=pred_size)
         pred_img_rgb = cv2.cvtColor(padded_img, cv2.COLOR_BGR2RGB)
         
         input_tensor = pred_img_rgb.astype(np.float32) / 255.0
@@ -147,62 +151,62 @@ class ObbDetector:
         input_tensor = np.expand_dims(input_tensor, axis=0)  # NCHW
 
         outputs = self.session.run(None, {self.input_name: input_tensor})
-        preds = outputs[0]  # Shape: (1, 4 + num_classes + 1, 8400)
-        preds = np.squeeze(preds, axis=0).transpose()  # Shape: (8400, 4 + num_classes + 1)
+        preds = outputs[0]  # Shape: (1, 4 + num_classes + 1, N_anchors)
+        preds = np.squeeze(preds, axis=0).transpose()  # (N_anchors, 4 + num_classes + 1)
         
-        # YOLOv8 OBB output format: (cx, cy, w, h, class_scores..., angle)
-        # Note: angle is the last element
-        
+        # YOLOv8 OBB output format: cx, cy, w, h, class_scores..., angle
         num_classes = preds.shape[1] - 5
-        boxes = preds[:, :4]
-        scores = preds[:, 4:4+num_classes]
+        boxes  = preds[:, :4]          # cx, cy, w, h  in padded-image space
+        scores = preds[:, 4:4 + num_classes]
         angles = preds[:, -1]
         
         max_scores = np.max(scores, axis=1)
-        class_ids = np.argmax(scores, axis=1)
+        class_ids  = np.argmax(scores, axis=1)
         
-        mask = max_scores >= 0.01  # loose threshold for NMS
-        
-        boxes = boxes[mask]
+        mask = max_scores >= 0.01   # loose pre-filter before NMS
+        boxes      = boxes[mask]
         max_scores = max_scores[mask]
-        class_ids = class_ids[mask]
-        angles = angles[mask]
+        class_ids  = class_ids[mask]
+        angles     = angles[mask]
         
         if len(boxes) == 0:
             return [], []
         
-        # Prepare for NMSBoxesRotated
-        # cv2.dnn.NMSBoxesRotated expects: [[(cx, cy), (w, h), angle_degrees], ...]
-        rotated_boxes = []
-        for i in range(len(boxes)):
-            cx, cy, w, h = boxes[i]
-            angle_deg = math.degrees(angles[i])
-            rotated_boxes.append(((float(cx), float(cy)), (float(w), float(h)), float(angle_deg)))
-            
+        # NMSBoxesRotated
+        rotated_boxes = [
+            ((float(cx), float(cy)), (float(w), float(h)), math.degrees(float(a)))
+            for (cx, cy, w, h), a in zip(boxes, angles)
+        ]
         indices = cv2.dnn.NMSBoxesRotated(rotated_boxes, max_scores.tolist(), 0.01, 0.45)
         
         results = []
         if len(indices) > 0:
-            indices = indices.flatten()
-            for idx in indices:
-                conf = max_scores[idx]
+            for idx in indices.flatten():
+                conf = float(max_scores[idx])
                 if conf < self.conf_threshold:
                     continue
                 
                 cls_id = class_ids[idx]
                 cx, cy, w, h = boxes[idx]
-                angle = angles[idx]
-                
+                angle = float(angles[idx])
+
+                # ── scale_boxes(xywh=True): subtract pad then divide by gain ──
+                # This mirrors: ops.scale_boxes(img.shape[2:], rboxes[:,:4], orig_img.shape, xywh=True)
+                ih, iw = pred_size
+                gain = min(iw / orig_w, ih / orig_h)
+                px = int(round((iw - round(orig_w * gain)) / 2.0 - 0.1))
+                py = int(round((ih - round(orig_h * gain)) / 2.0 - 0.1))
+                cx = (cx - px) / gain
+                cy = (cy - py) / gain
+                w  = w  / gain
+                h  = h  / gain
+
                 rbox = np.array([[cx, cy, w, h, angle]])
-                poly = xywhr2xyxyxyxy(rbox)[0]  # Shape (4, 2)
+                poly = xywhr2xyxyxyxy(rbox)[0]  # Shape (4, 2) in original image space
+
+                results.append((poly, int(cls_id), conf))
                 
-                # Map back to original image
-                poly[:, 0] = (poly[:, 0] - pad_w) / scale
-                poly[:, 1] = (poly[:, 1] - pad_h) / scale
-                
-                results.append((poly, cls_id, conf))
-                
-        return results, (padded_img, scale, pad_w, pad_h)
+        return results, (padded_img, scale, pad_left, pad_top)
 
 
     def detect_and_crop(self, image: Image.Image) -> list[ObbDetection]:

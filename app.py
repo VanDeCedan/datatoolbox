@@ -511,12 +511,20 @@ _om_obb_model: Optional[object] = None
 def get_om_obb_model():
     global _om_obb_model
     if _om_obb_model is None:
-        from huggingface_hub import hf_hub_download
-        from ultralytics import YOLO
-        
-        # Download from Nicias/det_om
-        model_path = hf_hub_download(repo_id="Nicias/det_om", filename="best.onnx")
-        _om_obb_model = YOLO(model_path, task='obb')
+        from obb_detector import ObbDetector
+        om_names = {
+            0: "CIP_BENIN", 1: "CIP_RECTO", 2: "CIP_VERSO", 3: "CNI_BENIN", 
+            4: "CNI_NEW_RECTO", 5: "CNI_NEW_VERSO", 6: "CNI_OLD_RECTO", 
+            7: "CNI_OLD_VERSO", 8: "LEPI_RECTO", 9: "LEPI_VERSO", 
+            10: "NINA_RECTO", 11: "NINA_VERSO", 12: "PASSEPORT_BENIN", 
+            13: "PASSEPORT_MALI", 14: "PASSEPORT_TOGO"
+        }
+        _om_obb_model = ObbDetector(
+            conf_threshold=0.25, 
+            repo_id="Nicias/det_om", 
+            filename="best.onnx",
+            names=om_names
+        )
     return _om_obb_model
 
 def run_om_obb_mode(
@@ -533,6 +541,7 @@ def run_om_obb_mode(
     log("🔮 Téléchargement / Chargement du modèle OM OBB (best.onnx)…")
     try:
         model = get_om_obb_model()
+        model.conf_threshold = conf # Update conf threshold dynamically
     except Exception as e:
         return f"❌ Erreur de chargement du modèle: {e}", None, None
 
@@ -540,6 +549,7 @@ def run_om_obb_mode(
     all_records = []
     import cv2
     import numpy as np
+    from PIL import Image
 
     try:
         tmp_path = Path(tmp_root)
@@ -555,28 +565,26 @@ def run_om_obb_mode(
             
             log(f"🖼️ Traitement : {fname}")
             try:
-                # inference
-                results = model.predict(source=fpath, conf=conf, save=False, verbose=False)
-                r = results[0]
+                pil_img = Image.open(fpath).convert("RGB")
+                img_array = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                original_h, original_w = img_array.shape[:2]
+                
+                # inference via obb_detector's pure ONNX logic
+                # target size 1024x1024 since best.onnx has 21504 anchors
+                results, _ = model._run_inference(img_array, pred_size=(640, 640))
                 
                 labels_text = ""
                 num_labels = 0
-                if hasattr(r, "obb") and r.obb is not None:
-                    obb = r.obb
-                    if hasattr(obb, "xyxyxyxyn") and obb.xyxyxyxyn is not None and len(obb.xyxyxyxyn) > 0:
-                        # get normalized coordinates using obb.xyxyxyxyn
-                        boxes = obb.xyxyxyxyn.cpu().numpy() if hasattr(obb.xyxyxyxyn, "cpu") else obb.xyxyxyxyn
-                        classes = obb.cls.cpu().numpy().astype(int) if hasattr(obb.cls, "cpu") else obb.cls.astype(int)
-                        confs = obb.conf.cpu().numpy() if hasattr(obb.conf, "cpu") else obb.conf
-
-                        for poly, cls_id, conf_val in zip(boxes, classes, confs):
-                            if conf_val < conf:
-                                continue
-                            # format: class x1 y1 x2 y2 x3 y3 x4 y4
-                            flat_poly = poly.reshape(-1)
-                            poly_str = " ".join([f"{coord:.6f}" for coord in flat_poly])
-                            labels_text += f"{int(cls_id)} {poly_str}\n"
-                            num_labels += 1
+                for poly, cls_id, conf_val in results:
+                    # poly is in original pixel coordinates
+                    pts = poly.copy()
+                    pts[:, 0] /= original_w
+                    pts[:, 1] /= original_h
+                    
+                    pts_flat = pts.flatten()
+                    coords_str = " ".join([f"{c:.6f}" for c in pts_flat])
+                    labels_text += f"{int(cls_id)} {coords_str}\n"
+                    num_labels += 1
                             
                 lbl_path = labels_dir / f"{stem}.txt"
                 with open(lbl_path, "w", encoding="utf-8") as f:
@@ -938,6 +946,66 @@ def run_merge_labels(image_paths: list[str], csv_paths: list[str], include_image
     except Exception as e:
         shutil.rmtree(tmp_root, ignore_errors=True)
         return f"❌ Erreur lors de la création du ZIP de sortie : {e}\n\nLogs de fusion :\n" + "\n".join(logs), None, None
+
+
+def split_images_into_batches(source_dir: str, target_dir: str, batch_size: float, mode: str) -> str:
+    if not source_dir or not os.path.exists(source_dir):
+        return f"⚠️ Le dossier source '{source_dir}' n'existe pas ou est invalide."
+    
+    batch_size = int(batch_size)
+    if batch_size < 1:
+        return "⚠️ Le nombre d'images par lot doit être au moins 1."
+        
+    if not target_dir:
+        target_dir = os.path.join(source_dir, "lots_images")
+        
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception as e:
+        return f"❌ Impossible de créer le dossier de destination : {e}"
+        
+    valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    images = []
+    
+    try:
+        with os.scandir(source_dir) as it:
+            for entry in it:
+                if entry.is_file() and Path(entry.name).suffix.lower() in valid_exts:
+                    images.append(entry.path)
+    except Exception as e:
+        return f"❌ Erreur lors de la lecture du dossier : {e}"
+        
+    if not images:
+        return f"⚠️ Aucune image trouvée dans '{source_dir}'."
+        
+    # Sort for consistency
+    images.sort()
+    total_images = len(images)
+    
+    import math
+    num_batches = math.ceil(total_images / batch_size)
+    
+    logs = [f"📋 {total_images} images trouvées. Création de {num_batches} lots..."]
+    
+    action_verb = "Copié" if mode == "Copier" else "Déplacé"
+    action_func = shutil.copy2 if mode == "Copier" else shutil.move
+    
+    processed = 0
+    for i in range(num_batches):
+        batch_folder = os.path.join(target_dir, f"lot_{i+1:03d}")
+        os.makedirs(batch_folder, exist_ok=True)
+        
+        batch_images = images[i * batch_size : (i + 1) * batch_size]
+        for img_path in batch_images:
+            dest_path = os.path.join(batch_folder, os.path.basename(img_path))
+            try:
+                action_func(img_path, dest_path)
+                processed += 1
+            except Exception as e:
+                logs.append(f"  ❌ Erreur ({action_verb.lower()}) sur {os.path.basename(img_path)}: {e}")
+                
+    logs.append(f"✅ Opération terminée : {processed}/{total_images} fichiers traités dans '{target_dir}'.")
+    return "\n".join(logs)
 
 
 # ---------------------------------------------------------------------------
@@ -2414,6 +2482,48 @@ with gr.Blocks(css=CUSTOM_CSS, title="Data Toolbox — Momo AI") as demo:
                         fn=fn_merge,
                         inputs=[batch_img_state, batch_csv_state, batch_zip_images],
                         outputs=[batch_log, batch_download, batch_df]
+                    )
+
+                with gr.Tab("Séparer en lots"):
+                    gr.Markdown("### 📂 Séparer les images d'un dossier en lots")
+                    gr.Markdown("Découpe automatiquement un grand dossier d'images en plusieurs sous-dossiers (lots) selon le nombre souhaité.")
+                    
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            split_input_dir = gr.Textbox(
+                                label="Chemin du dossier source (contenant les images)",
+                                placeholder="Ex: C:\\mes_images"
+                            )
+                            split_output_dir = gr.Textbox(
+                                label="Chemin du dossier de destination (optionnel)",
+                                placeholder="Laisser vide pour créer un dossier 'lots_images' dans la source",
+                                info="Si vide, les lots seront créés dans '<dossier_source>/lots_images'"
+                            )
+                        with gr.Column(scale=1):
+                            split_batch_size = gr.Number(
+                                label="Nombre d'images par lot",
+                                value=100,
+                                precision=0,
+                                minimum=1
+                            )
+                            split_mode = gr.Radio(
+                                choices=["Copier", "Déplacer (⚠️)"],
+                                value="Copier",
+                                label="Action sur les fichiers"
+                            )
+                    
+                    split_run_btn = gr.Button("🚀 Générer les lots", variant="primary")
+                    split_log = gr.Textbox(
+                        label="📋 Rapport d'opération",
+                        lines=10,
+                        interactive=False,
+                        placeholder="Le rapport s'affichera ici..."
+                    )
+                    
+                    split_run_btn.click(
+                        fn=split_images_into_batches,
+                        inputs=[split_input_dir, split_output_dir, split_batch_size, split_mode],
+                        outputs=[split_log]
                     )
 
 
