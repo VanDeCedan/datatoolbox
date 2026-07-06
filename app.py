@@ -505,6 +505,111 @@ def run_om_classifier(
 # ---------------------------------------------------------------------------
 # Tab 2 — Only Deskew
 # ---------------------------------------------------------------------------
+
+_om_obb_model: Optional[object] = None
+
+def get_om_obb_model():
+    global _om_obb_model
+    if _om_obb_model is None:
+        from huggingface_hub import hf_hub_download
+        from ultralytics import YOLO
+        
+        # Download from Nicias/det_om
+        model_path = hf_hub_download(repo_id="Nicias/det_om", filename="best.onnx")
+        _om_obb_model = YOLO(model_path, task='obb')
+    return _om_obb_model
+
+def run_om_obb_mode(
+    uploaded_files,
+    conf_pct: int,
+) -> tuple[str, str | None, object | None]:
+    if not uploaded_files:
+        return "⚠️ Aucun fichier uploadé.", None, None
+
+    conf = conf_pct / 100.0
+    logs = []
+    def log(msg: str): logs.append(msg)
+
+    log("🔮 Téléchargement / Chargement du modèle OM OBB (best.onnx)…")
+    try:
+        model = get_om_obb_model()
+    except Exception as e:
+        return f"❌ Erreur de chargement du modèle: {e}", None, None
+
+    tmp_root = tempfile.mkdtemp()
+    all_records = []
+    import cv2
+    import numpy as np
+
+    try:
+        tmp_path = Path(tmp_root)
+        out_dir = tmp_path / "output_om_obb"
+        out_dir.mkdir()
+        labels_dir = out_dir / "labels"
+        labels_dir.mkdir()
+
+        for fpath in uploaded_files:
+            fpath = _get_path(fpath)
+            fname = Path(fpath).name
+            stem = Path(fname).stem
+            
+            log(f"🖼️ Traitement : {fname}")
+            try:
+                # inference
+                results = model.predict(source=fpath, conf=conf, save=False, verbose=False)
+                r = results[0]
+                
+                labels_text = ""
+                num_labels = 0
+                if hasattr(r, "obb") and r.obb is not None:
+                    obb = r.obb
+                    if hasattr(obb, "xyxyxyxyn") and obb.xyxyxyxyn is not None and len(obb.xyxyxyxyn) > 0:
+                        # get normalized coordinates using obb.xyxyxyxyn
+                        boxes = obb.xyxyxyxyn.cpu().numpy() if hasattr(obb.xyxyxyxyn, "cpu") else obb.xyxyxyxyn
+                        classes = obb.cls.cpu().numpy().astype(int) if hasattr(obb.cls, "cpu") else obb.cls.astype(int)
+                        confs = obb.conf.cpu().numpy() if hasattr(obb.conf, "cpu") else obb.conf
+
+                        for poly, cls_id, conf_val in zip(boxes, classes, confs):
+                            if conf_val < conf:
+                                continue
+                            # format: class x1 y1 x2 y2 x3 y3 x4 y4
+                            flat_poly = poly.reshape(-1)
+                            poly_str = " ".join([f"{coord:.6f}" for coord in flat_poly])
+                            labels_text += f"{int(cls_id)} {poly_str}\n"
+                            num_labels += 1
+                            
+                lbl_path = labels_dir / f"{stem}.txt"
+                with open(lbl_path, "w", encoding="utf-8") as f:
+                    f.write(labels_text)
+                    
+                log(f"  ✅ Généré {num_labels} labels pour {fname}")
+                all_records.append({"Fichier": fname, "Labels": num_labels})
+
+            except Exception as exc:
+                log(f"  ❌ Erreur : {exc}")
+
+        if not all_records:
+            log("⚠️ Aucun résultat.")
+            return "\n".join(logs), None, None
+
+        log("📦 Génération du ZIP…")
+        zip_path = tmp_path / "results_om_obb.zip"
+        build_zip_to_file(labels_dir, zip_path)
+        zip_size = zip_path.stat().st_size
+        log(f"✅ ZIP prêt — {zip_size / 1024:.0f} KB")
+
+        import pandas as pd
+        df = pd.DataFrame(all_records)
+        return "\n".join(logs), str(zip_path), df
+
+    except Exception as exc:
+        try:
+            import shutil
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        except Exception:
+            pass
+        return f"❌ Erreur inattendue : {exc}", None, None
+
 def run_deskew(
     uploaded_files,
     conf_deskew_pct: int,
@@ -1741,244 +1846,334 @@ with gr.Blocks(css=CUSTOM_CSS, title="Data Toolbox — Momo AI") as demo:
         # ── Tab 3 : Texte (OBB) ─────────────────────────────────────────────
         with gr.Tab("Détecteur d'identifiant"):
             with gr.Tabs():
-                with gr.Tab("Détecter et découper"):
-                    gr.Markdown("### Détecter, redresser et découper")
-                    with gr.Row():
-                        with gr.Column(scale=1):
-                            obb_c1_files = gr.File(label="Upload Images", file_count="multiple", file_types=["image"], elem_classes=["horizontal-files"])
-                            obb_c1_files.change(fn=lambda f: gr.update(label=f"Upload Images ({len(f)} fichiers importés)") if f else gr.update(label="Upload Images"), inputs=obb_c1_files, outputs=obb_c1_files)
-                        with gr.Column(scale=1):
-                            obb_c1_conf = gr.Slider(minimum=10, maximum=100, value=25, step=5, label="Seuil de confiance (%)")
-                            obb_c1_card_type = gr.Dropdown(choices=["CEDEAO", "CIP", "CNI", "PASSEPORT"], value=None, label="Type de carte")
-
-                    obb_c1_btn = gr.Button("🚀 Lancer Crop & Resize", variant="primary")
-                    with gr.Row():
-                        obb_c1_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
-                    with gr.Row():
-                        obb_c1_dl = gr.File(label="⬇️ Télécharger ZIP")
-                        obb_c1_df = gr.Dataframe(label="📊 Résultats")
-
-                    def fn_obb_c1(files, conf, card_type):
-                        logs, zip_p, df = run_obb_mode(files, conf, "crop_resize", card_type=card_type)
-                        return logs, zip_p, df_update_with_count(df)
-                    obb_c1_btn.click(fn_obb_c1, inputs=[obb_c1_files, obb_c1_conf, obb_c1_card_type], outputs=[obb_c1_log, obb_c1_dl, obb_c1_df])
-
-                with gr.Tab("Générer Labels OBB"):
-                    gr.Markdown("### Générer un dataset YOLO OBB (images letterboxées et labels)")
-                    with gr.Row():
-                        with gr.Column(scale=1):
-                            obb_c2_files = gr.File(label="Upload Images", file_count="multiple", file_types=["image"], elem_classes=["horizontal-files"])
-                            obb_c2_files.change(fn=lambda f: gr.update(label=f"Upload Images ({len(f)} fichiers importés)") if f else gr.update(label="Upload Images"), inputs=obb_c2_files, outputs=obb_c2_files)
-                        with gr.Column(scale=1):
-                            obb_c2_conf = gr.Slider(minimum=10, maximum=100, value=25, step=5, label="Seuil de confiance (%)")
+                with gr.Tab("CARTE"):
+                    with gr.Tabs():
+                        with gr.Tab("Détecter et découper"):
+                            gr.Markdown("### Détecter, redresser et découper")
                             with gr.Row():
-                                obb_c2_w = gr.Number(label="Largeur cible (px)", value=640, precision=0)
-                                obb_c2_h = gr.Number(label="Hauteur cible (px)", value=640, precision=0)
+                                with gr.Column(scale=1):
+                                    obb_c1_files = gr.File(label="Upload Images", file_count="multiple", file_types=["image"], elem_classes=["horizontal-files"])
+                                    obb_c1_files.change(fn=lambda f: gr.update(label=f"Upload Images ({len(f)} fichiers importés)") if f else gr.update(label="Upload Images"), inputs=obb_c1_files, outputs=obb_c1_files)
+                                with gr.Column(scale=1):
+                                    obb_c1_conf = gr.Slider(minimum=10, maximum=100, value=25, step=5, label="Seuil de confiance (%)")
+                                    obb_c1_card_type = gr.Dropdown(choices=["CEDEAO", "CIP", "CNI", "PASSEPORT"], value=None, label="Type de carte")
 
-                    obb_c2_btn = gr.Button("Générer Dataset OBB", variant="primary")
-                    with gr.Row():
-                        obb_c2_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
-                    with gr.Row():
-                        obb_c2_dl = gr.File(label="⬇️ Télécharger ZIP (images + labels)")
-                        obb_c2_df = gr.Dataframe(label="📊 Résultats")
+                            obb_c1_btn = gr.Button("🚀 Lancer Crop & Resize", variant="primary")
+                            with gr.Row():
+                                obb_c1_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
+                            with gr.Row():
+                                obb_c1_dl = gr.File(label="⬇️ Télécharger ZIP")
+                                obb_c1_df = gr.Dataframe(label="📊 Résultats")
 
-                    def fn_obb_c2(files, conf, w, h):
-                        logs, zip_p, df = run_obb_mode(files, conf, "generate_labels", int(w), int(h), "")
-                        return logs, zip_p, df_update_with_count(df)
-                    obb_c2_btn.click(fn_obb_c2, inputs=[obb_c2_files, obb_c2_conf, obb_c2_w, obb_c2_h], outputs=[obb_c2_log, obb_c2_dl, obb_c2_df])
+                            def fn_obb_c1(files, conf, card_type):
+                                logs, zip_p, df = run_obb_mode(files, conf, "crop_resize", card_type=card_type)
+                                return logs, zip_p, df_update_with_count(df)
+                            obb_c1_btn.click(fn_obb_c1, inputs=[obb_c1_files, obb_c1_conf, obb_c1_card_type], outputs=[obb_c1_log, obb_c1_dl, obb_c1_df])
 
-                with gr.Tab("Get labels images"):
-                    gr.Markdown("### Appliquer des augmentations et split sur des datasets d'images et labels OBB")
+                        with gr.Tab("Générer Labels OBB"):
+                            gr.Markdown("### Générer un dataset YOLO OBB (images letterboxées et labels)")
+                            with gr.Row():
+                                with gr.Column(scale=1):
+                                    obb_c2_files = gr.File(label="Upload Images", file_count="multiple", file_types=["image"], elem_classes=["horizontal-files"])
+                                    obb_c2_files.change(fn=lambda f: gr.update(label=f"Upload Images ({len(f)} fichiers importés)") if f else gr.update(label="Upload Images"), inputs=obb_c2_files, outputs=obb_c2_files)
+                                with gr.Column(scale=1):
+                                    obb_c2_conf = gr.Slider(minimum=10, maximum=100, value=25, step=5, label="Seuil de confiance (%)")
+                                    with gr.Row():
+                                        obb_c2_w = gr.Number(label="Largeur cible (px)", value=640, precision=0)
+                                        obb_c2_h = gr.Number(label="Hauteur cible (px)", value=640, precision=0)
+
+                            obb_c2_btn = gr.Button("Générer Dataset OBB", variant="primary")
+                            with gr.Row():
+                                obb_c2_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
+                            with gr.Row():
+                                obb_c2_dl = gr.File(label="⬇️ Télécharger ZIP (images + labels)")
+                                obb_c2_df = gr.Dataframe(label="📊 Résultats")
+
+                            def fn_obb_c2(files, conf, w, h):
+                                logs, zip_p, df = run_obb_mode(files, conf, "generate_labels", int(w), int(h), "")
+                                return logs, zip_p, df_update_with_count(df)
+                            obb_c2_btn.click(fn_obb_c2, inputs=[obb_c2_files, obb_c2_conf, obb_c2_w, obb_c2_h], outputs=[obb_c2_log, obb_c2_dl, obb_c2_df])
+
+                with gr.Tab("OM"):
+                    with gr.Tabs():
+                        with gr.Tab("retrouver images de labels"):
+                            gr.Markdown("### Appliquer des augmentations et split sur des datasets d'images et labels OBB")
                     
-                    obb_c3_images_state = gr.State([])
-                    obb_c3_labels_state = gr.State([])
+                            obb_c3_images_state = gr.State([])
+                            obb_c3_labels_state = gr.State([])
 
-                    with gr.Row():
-                        with gr.Column(scale=1):
-                            obb_c3_images = gr.File(label="Upload Images (cumulatif)", file_count="multiple", file_types=["image"], elem_classes=["horizontal-files"])
                             with gr.Row():
-                                obb_c3_img_dir = gr.Textbox(label="Ou dossier d'images local", placeholder="Ex: C:\\images")
-                                obb_c3_img_scan_btn = gr.Button("🔍 Scanner images", variant="secondary")
-                            with gr.Row():
-                                obb_c3_images_status = gr.Markdown("**Images accumulées :** 0")
-                                obb_c3_images_clear = gr.Button("🗑️ Vider les images", variant="secondary")
-                        with gr.Column(scale=1):
-                            obb_c3_labels = gr.File(label="Upload Labels (OBB .txt) (cumulatif)", file_count="multiple", file_types=[".txt"], elem_classes=["horizontal-files"])
-                            with gr.Row():
-                                obb_c3_lbl_dir = gr.Textbox(label="Ou dossier de labels local", placeholder="Ex: C:\\labels")
-                                obb_c3_lbl_scan_btn = gr.Button("🔍 Scanner labels", variant="secondary")
-                            with gr.Row():
-                                obb_c3_labels_status = gr.Markdown("**Labels accumulés :** 0")
-                                obb_c3_labels_clear = gr.Button("🗑️ Vider les labels", variant="secondary")
+                                with gr.Column(scale=1):
+                                    obb_c3_images = gr.File(label="Upload Images (cumulatif)", file_count="multiple", file_types=["image"], elem_classes=["horizontal-files"])
+                                    with gr.Row():
+                                        obb_c3_img_dir = gr.Textbox(label="Ou dossier d'images local", placeholder="Ex: C:\\images")
+                                        obb_c3_img_scan_btn = gr.Button("🔍 Scanner images", variant="secondary")
+                                    with gr.Row():
+                                        obb_c3_images_status = gr.Markdown("**Images accumulées :** 0")
+                                        obb_c3_images_clear = gr.Button("🗑️ Vider les images", variant="secondary")
+                                with gr.Column(scale=1):
+                                    obb_c3_labels = gr.File(label="Upload Labels (OBB .txt) (cumulatif)", file_count="multiple", file_types=[".txt"], elem_classes=["horizontal-files"])
+                                    with gr.Row():
+                                        obb_c3_lbl_dir = gr.Textbox(label="Ou dossier de labels local", placeholder="Ex: C:\\labels")
+                                        obb_c3_lbl_scan_btn = gr.Button("🔍 Scanner labels", variant="secondary")
+                                    with gr.Row():
+                                        obb_c3_labels_status = gr.Markdown("**Labels accumulés :** 0")
+                                        obb_c3_labels_clear = gr.Button("🗑️ Vider les labels", variant="secondary")
 
-                    def add_c3_images(new_files, current_state):
-                        if not new_files:
-                            yield current_state, f"**Images accumulées :** {len(current_state)}"
-                            return
-                        import gc
-                        existing_names = {Path(p).name for p in current_state}
-                        batch_size = 50
-                        total_new = len(new_files)
-                        for i in range(0, total_new, batch_size):
-                            batch = new_files[i:i+batch_size]
-                            for f in batch:
-                                path_str = _get_path(f)
-                                name = Path(path_str).name
-                                if name not in existing_names:
-                                    current_state.append(path_str)
-                                    existing_names.add(name)
-                            gc.collect()
-                            yield current_state, f"**Images accumulées :** {len(current_state)} (Chargement : {min(i+batch_size, total_new)}/{total_new})"
-                        yield current_state, f"**Images accumulées :** {len(current_state)}"
+                            def add_c3_images(new_files, current_state):
+                                if not new_files:
+                                    yield current_state, f"**Images accumulées :** {len(current_state)}"
+                                    return
+                                import gc
+                                existing_names = {Path(p).name for p in current_state}
+                                batch_size = 50
+                                total_new = len(new_files)
+                                for i in range(0, total_new, batch_size):
+                                    batch = new_files[i:i+batch_size]
+                                    for f in batch:
+                                        path_str = _get_path(f)
+                                        name = Path(path_str).name
+                                        if name not in existing_names:
+                                            current_state.append(path_str)
+                                            existing_names.add(name)
+                                    gc.collect()
+                                    yield current_state, f"**Images accumulées :** {len(current_state)} (Chargement : {min(i+batch_size, total_new)}/{total_new})"
+                                yield current_state, f"**Images accumulées :** {len(current_state)}"
 
-                    def add_c3_labels(new_files, current_state):
-                        if not new_files:
-                            yield current_state, f"**Labels accumulés :** {len(current_state)}"
-                            return
-                        import gc
-                        existing_names = {Path(p).name for p in current_state}
-                        batch_size = 50
-                        total_new = len(new_files)
-                        for i in range(0, total_new, batch_size):
-                            batch = new_files[i:i+batch_size]
-                            for f in batch:
-                                path_str = _get_path(f)
-                                name = Path(path_str).name
-                                if name not in existing_names:
-                                    current_state.append(path_str)
-                                    existing_names.add(name)
-                            gc.collect()
-                            yield current_state, f"**Labels accumulés :** {len(current_state)} (Chargement : {min(i+batch_size, total_new)}/{total_new})"
-                        yield current_state, f"**Labels accumulés :** {len(current_state)}"
+                            def add_c3_labels(new_files, current_state):
+                                if not new_files:
+                                    yield current_state, f"**Labels accumulés :** {len(current_state)}"
+                                    return
+                                import gc
+                                existing_names = {Path(p).name for p in current_state}
+                                batch_size = 50
+                                total_new = len(new_files)
+                                for i in range(0, total_new, batch_size):
+                                    batch = new_files[i:i+batch_size]
+                                    for f in batch:
+                                        path_str = _get_path(f)
+                                        name = Path(path_str).name
+                                        if name not in existing_names:
+                                            current_state.append(path_str)
+                                            existing_names.add(name)
+                                    gc.collect()
+                                    yield current_state, f"**Labels accumulés :** {len(current_state)} (Chargement : {min(i+batch_size, total_new)}/{total_new})"
+                                yield current_state, f"**Labels accumulés :** {len(current_state)}"
 
-                    def scan_c3_img_dir(dir_path, current_state):
-                        if not dir_path or not os.path.exists(dir_path):
-                            yield current_state, f"⚠️ Le dossier '{dir_path}' n'existe pas."
-                            return
-                        valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-                        found_files = []
-                        try:
-                            with os.scandir(dir_path) as it:
-                                for entry in it:
-                                    if entry.is_file():
-                                        ext = Path(entry.name).suffix.lower()
-                                        if ext in valid_exts:
-                                            found_files.append(entry.path)
-                        except Exception as e:
-                            yield current_state, f"❌ Erreur lors du scan : {e}"
-                            return
-                        if not found_files:
-                            yield current_state, f"⚠️ Aucune image trouvée dans '{dir_path}'."
-                            return
+                            def scan_c3_img_dir(dir_path, current_state):
+                                if not dir_path or not os.path.exists(dir_path):
+                                    yield current_state, f"⚠️ Le dossier '{dir_path}' n'existe pas."
+                                    return
+                                valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+                                found_files = []
+                                try:
+                                    with os.scandir(dir_path) as it:
+                                        for entry in it:
+                                            if entry.is_file():
+                                                ext = Path(entry.name).suffix.lower()
+                                                if ext in valid_exts:
+                                                    found_files.append(entry.path)
+                                except Exception as e:
+                                    yield current_state, f"❌ Erreur lors du scan : {e}"
+                                    return
+                                if not found_files:
+                                    yield current_state, f"⚠️ Aucune image trouvée dans '{dir_path}'."
+                                    return
                         
-                        yield from add_c3_images(found_files, current_state)
+                                yield from add_c3_images(found_files, current_state)
 
-                    def scan_c3_lbl_dir(dir_path, current_state):
-                        if not dir_path or not os.path.exists(dir_path):
-                            yield current_state, f"⚠️ Le dossier '{dir_path}' n'existe pas."
-                            return
-                        found_files = []
-                        try:
-                            with os.scandir(dir_path) as it:
-                                for entry in it:
-                                    if entry.is_file():
-                                        ext = Path(entry.name).suffix.lower()
-                                        if ext == '.txt':
-                                            found_files.append(entry.path)
-                        except Exception as e:
-                            yield current_state, f"❌ Erreur lors du scan : {e}"
-                            return
-                        if not found_files:
-                            yield current_state, f"⚠️ Aucun fichier .txt trouvé dans '{dir_path}'."
-                            return
+                            def scan_c3_lbl_dir(dir_path, current_state):
+                                if not dir_path or not os.path.exists(dir_path):
+                                    yield current_state, f"⚠️ Le dossier '{dir_path}' n'existe pas."
+                                    return
+                                found_files = []
+                                try:
+                                    with os.scandir(dir_path) as it:
+                                        for entry in it:
+                                            if entry.is_file():
+                                                ext = Path(entry.name).suffix.lower()
+                                                if ext == '.txt':
+                                                    found_files.append(entry.path)
+                                except Exception as e:
+                                    yield current_state, f"❌ Erreur lors du scan : {e}"
+                                    return
+                                if not found_files:
+                                    yield current_state, f"⚠️ Aucun fichier .txt trouvé dans '{dir_path}'."
+                                    return
                         
-                        yield from add_c3_labels(found_files, current_state)
+                                yield from add_c3_labels(found_files, current_state)
 
-                    obb_c3_images.change(
-                        fn=add_c3_images,
-                        inputs=[obb_c3_images, obb_c3_images_state],
-                        outputs=[obb_c3_images_state, obb_c3_images_status]
-                    )
-                    obb_c3_labels.change(
-                        fn=add_c3_labels,
-                        inputs=[obb_c3_labels, obb_c3_labels_state],
-                        outputs=[obb_c3_labels_state, obb_c3_labels_status]
-                    )
+                            obb_c3_images.change(
+                                fn=add_c3_images,
+                                inputs=[obb_c3_images, obb_c3_images_state],
+                                outputs=[obb_c3_images_state, obb_c3_images_status]
+                            )
+                            obb_c3_labels.change(
+                                fn=add_c3_labels,
+                                inputs=[obb_c3_labels, obb_c3_labels_state],
+                                outputs=[obb_c3_labels_state, obb_c3_labels_status]
+                            )
                     
-                    obb_c3_img_scan_btn.click(
-                        fn=scan_c3_img_dir,
-                        inputs=[obb_c3_img_dir, obb_c3_images_state],
-                        outputs=[obb_c3_images_state, obb_c3_images_status]
-                    )
-                    obb_c3_lbl_scan_btn.click(
-                        fn=scan_c3_lbl_dir,
-                        inputs=[obb_c3_lbl_dir, obb_c3_labels_state],
-                        outputs=[obb_c3_labels_state, obb_c3_labels_status]
-                    )
+                            obb_c3_img_scan_btn.click(
+                                fn=scan_c3_img_dir,
+                                inputs=[obb_c3_img_dir, obb_c3_images_state],
+                                outputs=[obb_c3_images_state, obb_c3_images_status]
+                            )
+                            obb_c3_lbl_scan_btn.click(
+                                fn=scan_c3_lbl_dir,
+                                inputs=[obb_c3_lbl_dir, obb_c3_labels_state],
+                                outputs=[obb_c3_labels_state, obb_c3_labels_status]
+                            )
 
-                    obb_c3_images_clear.click(
-                        fn=lambda: ([], "**Images accumulées :** 0"),
-                        inputs=[],
-                        outputs=[obb_c3_images_state, obb_c3_images_status]
-                    )
-                    obb_c3_labels_clear.click(
-                        fn=lambda: ([], "**Labels accumulés :** 0"),
-                        inputs=[],
-                        outputs=[obb_c3_labels_state, obb_c3_labels_status]
-                    )
+                            obb_c3_images_clear.click(
+                                fn=lambda: ([], "**Images accumulées :** 0"),
+                                inputs=[],
+                                outputs=[obb_c3_images_state, obb_c3_images_status]
+                            )
+                            obb_c3_labels_clear.click(
+                                fn=lambda: ([], "**Labels accumulés :** 0"),
+                                inputs=[],
+                                outputs=[obb_c3_labels_state, obb_c3_labels_status]
+                            )
 
-                    with gr.Row():
-                        with gr.Column(scale=1):
-                            gr.Markdown("#### Options d'Augmentations géométriques (Flipping)")
-                            aug_flip_h = gr.Checkbox(label="Flip Horizontal", value=True)
-                            aug_flip_v = gr.Checkbox(label="Flip Vertical", value=False)
-                            aug_flip_hv = gr.Checkbox(label="Both (H+V) Flip", value=False)
-                        with gr.Column(scale=1):
-                            gr.Markdown("#### Options d'Augmentations de rendu")
-                            aug_grain = gr.Checkbox(label="Camera Grain", value=True)
-                            aug_noise = gr.Checkbox(label="Gaussian & Salt/Pepper Noise", value=True)
-                            aug_blur = gr.Checkbox(label="Gaussian Blur", value=True)
+                            with gr.Row():
+                                with gr.Column(scale=1):
+                                    gr.Markdown("#### Options d'Augmentations géométriques (Flipping)")
+                                    aug_flip_h = gr.Checkbox(label="Flip Horizontal", value=True)
+                                    aug_flip_v = gr.Checkbox(label="Flip Vertical", value=False)
+                                    aug_flip_hv = gr.Checkbox(label="Both (H+V) Flip", value=False)
+                                with gr.Column(scale=1):
+                                    gr.Markdown("#### Options d'Augmentations de rendu")
+                                    aug_grain = gr.Checkbox(label="Camera Grain", value=True)
+                                    aug_noise = gr.Checkbox(label="Gaussian & Salt/Pepper Noise", value=True)
+                                    aug_blur = gr.Checkbox(label="Gaussian Blur", value=True)
                     
-                    with gr.Row():
-                        num_augs = gr.Slider(minimum=1, maximum=20, value=3, step=1, label="Nombre d'augmentations à générer par image")
+                            with gr.Row():
+                                num_augs = gr.Slider(minimum=1, maximum=20, value=3, step=1, label="Nombre d'augmentations à générer par image")
 
-                    with gr.Group():
-                        split_enabled = gr.Checkbox(label="Activer le Split Dataset (Train / Valid / Test)", value=True)
-                        with gr.Row() as split_row:
-                            train_pct = gr.Slider(minimum=0, maximum=100, value=70, step=1, label="Train (%)")
-                            val_pct = gr.Slider(minimum=0, maximum=100, value=15, step=1, label="Valid (%)")
-                            test_pct = gr.Slider(minimum=0, maximum=100, value=15, step=1, label="Test (%)")
+                            with gr.Group():
+                                split_enabled = gr.Checkbox(label="Activer le Split Dataset (Train / Valid / Test)", value=True)
+                                with gr.Row() as split_row:
+                                    train_pct = gr.Slider(minimum=0, maximum=100, value=70, step=1, label="Train (%)")
+                                    val_pct = gr.Slider(minimum=0, maximum=100, value=15, step=1, label="Valid (%)")
+                                    test_pct = gr.Slider(minimum=0, maximum=100, value=15, step=1, label="Test (%)")
 
-                    def toggle_split_visibility(is_checked):
-                        return gr.update(visible=is_checked)
-                    split_enabled.change(fn=toggle_split_visibility, inputs=split_enabled, outputs=split_row)
+                            def toggle_split_visibility(is_checked):
+                                return gr.update(visible=is_checked)
+                            split_enabled.change(fn=toggle_split_visibility, inputs=split_enabled, outputs=split_row)
 
-                    obb_c3_btn = gr.Button("⚡ Générer Dataset augmenté & packagé", variant="primary")
+                            obb_c3_btn = gr.Button("⚡ Générer Dataset augmenté & packagé", variant="primary")
                     
-                    with gr.Row():
-                        obb_c3_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
-                    with gr.Row():
-                        obb_c3_dl = gr.File(label="⬇️ Télécharger ZIP (Dataset YOLO OBB)")
-                        obb_c3_df = gr.Dataframe(label="📊 Résultats")
+                            with gr.Row():
+                                obb_c3_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
+                            with gr.Row():
+                                obb_c3_dl = gr.File(label="⬇️ Télécharger ZIP (Dataset YOLO OBB)")
+                                obb_c3_df = gr.Dataframe(label="📊 Résultats")
 
-                    def fn_obb_c3(images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, count, split_on, train, val, test):
-                        for logs, zip_p, df in run_get_labels_images(
-                            images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, int(count), split_on, train, val, test
-                        ):
-                            yield logs, gr.update(value=zip_p, visible=zip_p is not None), df_update_with_count(df, "📊 Résultats Dataset augmenté")
+                            def fn_obb_c3(images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, count, split_on, train, val, test):
+                                for logs, zip_p, df in run_get_labels_images(
+                                    images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, int(count), split_on, train, val, test
+                                ):
+                                    yield logs, gr.update(value=zip_p, visible=zip_p is not None), df_update_with_count(df, "📊 Résultats Dataset augmenté")
                         
-                    obb_c3_btn.click(
-                        fn=fn_obb_c3,
-                        inputs=[
-                            obb_c3_images_state, obb_c3_labels_state,
-                            aug_flip_h, aug_flip_v, aug_flip_hv,
-                            aug_grain, aug_noise, aug_blur,
-                            num_augs,
-                            split_enabled, train_pct, val_pct, test_pct
-                        ],
-                        outputs=[obb_c3_log, obb_c3_dl, obb_c3_df]
-                    )
+                            obb_c3_btn.click(
+                                fn=fn_obb_c3,
+                                inputs=[
+                                    obb_c3_images_state, obb_c3_labels_state,
+                                    aug_flip_h, aug_flip_v, aug_flip_hv,
+                                    aug_grain, aug_noise, aug_blur,
+                                    num_augs,
+                                    split_enabled, train_pct, val_pct, test_pct
+                                ],
+                                outputs=[obb_c3_log, obb_c3_dl, obb_c3_df]
+                            )
 
+                        with gr.Tab("Générer labels OBB"):
+                            gr.Markdown("### Générer un dataset YOLO OBB avec le modèle OM")
+                            
+                            om_obb_images_state = gr.State([])
+                            
+                            with gr.Row():
+                                with gr.Column(scale=1):
+                                    om_obb_files = gr.File(label="Upload Images (cumulatif)", file_count="multiple", file_types=["image"], elem_classes=["horizontal-files"])
+                                    with gr.Row():
+                                        om_obb_img_dir = gr.Textbox(label="Ou dossier d'images local", placeholder="Ex: C:\\images")
+                                        om_obb_img_scan_btn = gr.Button("🔍 Scanner images", variant="secondary")
+                                    with gr.Row():
+                                        om_obb_images_status = gr.Markdown("**Images accumulées :** 0")
+                                        om_obb_images_clear = gr.Button("🗑️ Vider les images", variant="secondary")
+                                with gr.Column(scale=1):
+                                    om_obb_conf = gr.Slider(minimum=10, maximum=100, value=25, step=5, label="Seuil de confiance (%)")
+
+                            om_obb_btn = gr.Button("Générer Dataset OBB OM", variant="primary")
+                            with gr.Row():
+                                om_obb_log = gr.Textbox(label="📋 Logs", lines=8, interactive=False)
+                            with gr.Row():
+                                om_obb_dl = gr.File(label="⬇️ Télécharger ZIP (labels OBB uniquement)")
+                                om_obb_df = gr.Dataframe(label="📊 Résultats")
+
+                            def add_om_obb_images(new_files, current_state):
+                                if not new_files:
+                                    yield current_state, f"**Images accumulées :** {len(current_state)}"
+                                    return
+                                import gc
+                                existing_names = {Path(p).name for p in current_state}
+                                batch_size = 50
+                                total_new = len(new_files)
+                                for i in range(0, total_new, batch_size):
+                                    batch = new_files[i:i+batch_size]
+                                    for f in batch:
+                                        path_str = _get_path(f)
+                                        name = Path(path_str).name
+                                        if name not in existing_names:
+                                            current_state.append(path_str)
+                                            existing_names.add(name)
+                                    gc.collect()
+                                    yield current_state, f"**Images accumulées :** {len(current_state)} (Chargement : {min(i+batch_size, total_new)}/{total_new})"
+                                yield current_state, f"**Images accumulées :** {len(current_state)}"
+
+                            def scan_om_obb_img_dir(dir_path, current_state):
+                                if not dir_path or not os.path.exists(dir_path):
+                                    yield current_state, f"⚠️ Le dossier '{dir_path}' n'existe pas."
+                                    return
+                                valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+                                found_files = []
+                                try:
+                                    with os.scandir(dir_path) as it:
+                                        for entry in it:
+                                            if entry.is_file():
+                                                ext = Path(entry.name).suffix.lower()
+                                                if ext in valid_exts:
+                                                    found_files.append(entry.path)
+                                except Exception as e:
+                                    yield current_state, f"❌ Erreur lors du scan : {e}"
+                                    return
+                                if not found_files:
+                                    yield current_state, f"⚠️ Aucune image trouvée dans '{dir_path}'."
+                                    return
+
+                                yield from add_om_obb_images(found_files, current_state)
+
+                            om_obb_files.change(
+                                fn=add_om_obb_images,
+                                inputs=[om_obb_files, om_obb_images_state],
+                                outputs=[om_obb_images_state, om_obb_images_status]
+                            )
+                            om_obb_img_scan_btn.click(
+                                fn=scan_om_obb_img_dir,
+                                inputs=[om_obb_img_dir, om_obb_images_state],
+                                outputs=[om_obb_images_state, om_obb_images_status]
+                            )
+                            om_obb_images_clear.click(
+                                fn=lambda: ([], "**Images accumulées :** 0"),
+                                inputs=[],
+                                outputs=[om_obb_images_state, om_obb_images_status]
+                            )
+
+                            def fn_om_obb(files, conf):
+                                logs, zip_p, df = run_om_obb_mode(files, conf)
+                                return logs, zip_p, df_update_with_count(df)
+                            om_obb_btn.click(fn_om_obb, inputs=[om_obb_images_state, om_obb_conf], outputs=[om_obb_log, om_obb_dl, om_obb_df])
         # ── Tab 4 : Reconnaissance (OCR) ─────────────────────────────────────────────
         with gr.Tab("🔤 Reconnaissance"):
             with gr.Tabs():
