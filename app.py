@@ -1170,9 +1170,19 @@ def run_get_labels_images(
     train_pct: float,
     val_pct: float,
     test_pct: float,
+    resize_dim: str = "624 x 624",
 ):
     import random
     import gc
+    
+    target_size = (624, 624)
+    if resize_dim:
+        try:
+            parts = resize_dim.lower().split("x")
+            if len(parts) == 2:
+                target_size = (int(parts[0].strip()), int(parts[1].strip()))
+        except Exception:
+            pass
     
     if not uploaded_images:
         yield "⚠️ Aucun fichier image importé.", None, None
@@ -1294,7 +1304,9 @@ def run_get_labels_images(
                 log(f"  - [{processed_count}/{total_pairs}] Traitement de {stem}...")
                 
                 try:
-                    with Image.open(img_path).convert("RGB") as pil_img:
+                    with Image.open(img_path).convert("RGB") as raw_img:
+                        resample_filter = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                        pil_img = raw_img.resize(target_size, resample_filter)
                         obb_labels = []
                         try:
                             with open(lbl_path, "r", encoding="utf-8") as f:
@@ -1306,6 +1318,7 @@ def run_get_labels_images(
                                         obb_labels.append((class_id, coords))
                         except Exception as e:
                             log(f"  ❌ Impossible de charger le label {Path(lbl_path).name} : {e}")
+                            pil_img.close()
                             continue
                         
                         orig_img_name = f"{stem}.jpg"
@@ -1430,6 +1443,7 @@ def run_get_labels_images(
                                 "Split": split_name if split_name else "root",
                                 "Statut": "OK"
                             })
+                        pil_img.close()
                             
                 except Exception as e:
                     log(f"  ❌ Impossible de charger l'image {Path(img_path).name} : {e}")
@@ -2050,6 +2064,11 @@ with gr.Blocks(css=CUSTOM_CSS, title="Data Toolbox — Momo AI") as demo:
                     
                             with gr.Row():
                                 num_augs = gr.Slider(minimum=1, maximum=20, value=3, step=1, label="Nombre d'augmentations à générer par image")
+                                obb_c3_resize = gr.Dropdown(
+                                    choices=["624 x 624", "512 x 512", "256 x 256", "224 x 224"],
+                                    value="624 x 624",
+                                    label="Taille de redimensionnement des images de sortie"
+                                )
 
                             with gr.Group():
                                 split_enabled = gr.Checkbox(label="Activer le Split Dataset (Train / Valid / Test)", value=True)
@@ -2070,9 +2089,9 @@ with gr.Blocks(css=CUSTOM_CSS, title="Data Toolbox — Momo AI") as demo:
                                 obb_c3_dl = gr.File(label="⬇️ Télécharger ZIP (Dataset YOLO OBB)")
                                 obb_c3_df = gr.Dataframe(label="📊 Résultats")
 
-                            def fn_obb_c3(images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, count, split_on, train, val, test):
+                            def fn_obb_c3(images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, count, split_on, train, val, test, resize_size):
                                 for logs, zip_p, df in run_get_labels_images(
-                                    images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, int(count), split_on, train, val, test
+                                    images, labels, flip_h, flip_v, flip_hv, grain, noise, blur, int(count), split_on, train, val, test, resize_size
                                 ):
                                     yield logs, gr.update(value=zip_p, visible=zip_p is not None), df_update_with_count(df, "📊 Résultats Dataset augmenté")
                         
@@ -2083,7 +2102,8 @@ with gr.Blocks(css=CUSTOM_CSS, title="Data Toolbox — Momo AI") as demo:
                                     aug_flip_h, aug_flip_v, aug_flip_hv,
                                     aug_grain, aug_noise, aug_blur,
                                     num_augs,
-                                    split_enabled, train_pct, val_pct, test_pct
+                                    split_enabled, train_pct, val_pct, test_pct,
+                                    obb_c3_resize
                                 ],
                                 outputs=[obb_c3_log, obb_c3_dl, obb_c3_df]
                             )
